@@ -2,7 +2,7 @@
 •	Students are asked to write a new system call named sys_hello, which will return a simple string such as "Hello, World!" to the user. (20 pts)
 
 ### Code Example (for sys_hello):
-```
+```C
 // sys_hello.c file in the kernel source tree
 
 #include <linux/kernel.h>
