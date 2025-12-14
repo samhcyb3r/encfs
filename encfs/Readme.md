@@ -1,8 +1,6 @@
 # 加密記憶體檔案系統（Encrypted In-Memory Filesystem using FUSE）
 
 
----
-
 # 1. 簡介（Introduction）
 
 本作業旨在建立一個運作於使用者空間的檔案系統（FUSE），並在檔案內容層加入 AES-256-GCM 加密，以確保資料在記憶體中的安全性。本系統採用 in-memory filesystem 設計，不會在磁碟上留下任何資料。
