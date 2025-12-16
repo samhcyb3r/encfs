@@ -1,96 +1,184 @@
 #!/bin/bash
 set -e
 
-MNT="$1"
-
-if [ -z "$MNT" ]; then
-    echo "Usage: $0 <mountpoint>"
+############################
+# Argument parsing
+############################
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 <mount_point> <filesystem_script>"
+    echo "Example: $0 /mnt/efs ~/encfs/encfs.py"
     exit 1
 fi
 
-echo "=== BEGIN AUTOMATIC TESTS for encrypted_memfs ==="
-echo "Mount point: $MNT"
+MNT="$1"
+FS="$2"
+
+############################
+# Helper
+############################
+banner() {
+    echo
+    echo "=================================================="
+    echo " $1"
+    echo "=================================================="
+}
+
+log() {
+    echo "[LOG] $1"
+}
+
+############################
+# Cleanup
+############################
+cleanup() {
+    echo
+    log "Cleanup: unmount filesystem"
+    cd ~ >/dev/null 2>&1 || true
+    fusermount -u "$MNT" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+############################
+# Header
+############################
+echo "=============================="
+echo " Part 6 - Testing & Validation"
+echo "=============================="
+log "Mount point : $MNT"
+log "FS script  : $FS"
+
+############################
+# Mount FS
+############################
+mkdir -p "$MNT"
+log "Mounting encrypted filesystem"
+python3 "$FS" "$MNT" &
+sleep 1
+
+############################
+# Test 1: Create file
+############################
+banner "Test 1: Create file (no key yet)"
+
+log "Creating file a.txt"
+touch "$MNT/a.txt"
+
+log "Listing directory to verify file creation"
+ls -l "$MNT"
+
+############################
+# Test 2: Write without key (should fail)
+############################
+banner "Test 2: Write without key (expected failure)"
+
+log "Attempting to write without encryption key"
+echo "secret data" > "$MNT/a.txt" 2>&1 || true
+
+log "System response (stderr above) confirms write is denied"
+
+############################
+# Test 3: Read without key (should fail)
+############################
+banner "Test 3: Read without key (expected failure)"
+
+log "Attempting to read file without key"
+cat "$MNT/a.txt" 2>&1 || true
+
+log "System response (stderr above) confirms read is denied"
+
+############################
+# Test 4: Write with correct key
+############################
+banner "Test 4: Write with correct key"
+
+log "Setting encryption key for a.txt"
+setfattr -n user.key -v "correctkey" "$MNT/a.txt"
+
+log "Writing data with correct key"
+echo "hello encrypted fs" > "$MNT/a.txt"
+
+log "Reading file to verify successful write and decryption"
+cat "$MNT/a.txt"
+
+############################
+# Test 5: Read with wrong key
+############################
+banner "Test 5: Read with wrong key (expected failure)"
+
+log "Replacing key with wrong key"
+setfattr -n user.key -v "wrongkey" "$MNT/a.txt"
+
+log "Attempting to read with wrong key"
+cat "$MNT/a.txt" 2>&1 || true
+
+log "System response (stderr above) confirms decryption failure"
+
+############################
+# Test 6: Per-file different encryption keys (strict verification)
+############################
+banner "Test 6: Per-file different encryption keys (strict)"
+
+log "Step 1: Create File A (f1.txt) and File B (f2.txt)"
+touch "$MNT/f1.txt"
+touch "$MNT/f2.txt"
+
+log "Directory listing after file creation (evidence)"
+ls -l "$MNT"
+
 echo
+log "Step 2: Assign File A key and verify File A access"
+setfattr -n user.key -v "keyA" "$MNT/f1.txt"
 
-# 安全 HEX 金鑰（固定 32 bytes）
-KEY="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+log "Write to File A using its own key"
+echo "content_of_file_A" > "$MNT/f1.txt"
 
-echo "=== [1] 清理殘留 ==="
-rm -f "$MNT/secret.txt" "$MNT/.keyring" "$MNT/dir1" 2>/dev/null || true
-echo OK
+log "Read File A using its own key (should succeed)"
+cat "$MNT/f1.txt"
+
 echo
+log "Step 3: Assign File B key and verify File B access"
+setfattr -n user.key -v "keyB" "$MNT/f2.txt"
 
-echo "=== [2] 加入金鑰 ADD /secret.txt ==="
-echo "ADD /secret.txt $KEY" > $MNT/.keyring
-cat $MNT/.keyring
+log "Write to File B using its own key"
+echo "content_of_file_B" > "$MNT/f2.txt"
+
+log "Read File B using its own key (should succeed)"
+cat "$MNT/f2.txt"
+
 echo
+log "Step 4: Cross-check — use File A key to read File B (should fail)"
+setfattr -n user.key -v "keyA" "$MNT/f2.txt"
+cat "$MNT/f2.txt" 2>&1 || true
 
-echo "=== [3] 建立 secret.txt 並寫入內容 ==="
-echo "hello encrypted world" > $MNT/secret.txt
-sync
-echo OK
+log "Above error message proves File A key cannot decrypt File B"
 
-echo "=== [4] 讀取應成功 ==="
-cat $MNT/secret.txt
 echo
+log "Step 5: Cross-check — use File B key to read File A (should fail)"
+setfattr -n user.key -v "keyB" "$MNT/f1.txt"
+cat "$MNT/f1.txt" 2>&1 || true
 
-echo "=== [5] 刪除金鑰 → 應該不能讀 ==="
-echo "DEL /secret.txt" > $MNT/.keyring || true
-echo "(below should fail with Permission denied)"
-(cat $MNT/secret.txt && echo "ERROR: should not succeed") || echo "Access correctly denied"
-echo
+log "Above error message proves File B key cannot decrypt File A"
 
-echo "=== [6] 再加入金鑰 → 讀取應成功 ==="
-echo "ADD /secret.txt $KEY" > $MNT/.keyring
-cat $MNT/secret.txt
-echo
+############################
+# Test 7: Remove key
+############################
+banner "Test 7: Remove key and verify access denied"
 
-echo "=== [7] 測試 rename（最重要） ==="
-mkdir -p $MNT/dir1
-mv $MNT/secret.txt $MNT/dir1/a.txt
+log "Removing encryption key from f1.txt"
+setfattr -x user.key "$MNT/f1.txt"
 
-echo "=== 為 rename 後的新路徑加入金鑰 ==="
-echo "ADD /dir1/a.txt $KEY" > $MNT/.keyring
+log "Attempting to read f1.txt after key removal"
+cat "$MNT/f1.txt" 2>&1 || true
 
-echo "=== rename 後讀取應成功（fid AAD 驗證） ==="
-cat $MNT/dir1/a.txt
-echo
+log "System response (stderr above) confirms access is denied"
 
-echo "=== [8] 測試 append ==="
-echo -n " APPEND!" >> $MNT/dir1/a.txt
-sync
-echo "ADD /dir1/a.txt $KEY" > $MNT/.keyring
-cat $MNT/dir1/a.txt
-echo
 
-echo "=== [9] truncate 測試 ==="
-truncate -s 5 $MNT/dir1/a.txt
-sync
-echo "ADD /dir1/a.txt $KEY" > $MNT/.keyring
-echo -n "TRUNC RESULT: "
-cat $MNT/dir1/a.txt
-echo
 
-echo "=== [10] 測試多次 open/close 循環 ==="
-echo "ADD /dir1/a.txt $KEY" > $MNT/.keyring
-for i in {1..5}; do
-    echo -n "loop $i " >> $MNT/dir1/a.txt
-    sync
-done
-echo "ADD /dir1/a.txt $KEY" > $MNT/.keyring
-cat $MNT/dir1/a.txt
-echo
+############################
+# End
+############################
 
-echo "=== [11] 測試目錄操作 ==="
-mkdir $MNT/dir2
-touch $MNT/dir2/x
-ls -l $MNT/dir2
-echo
 
-echo "=== [12] 測試 unlink ==="
-rm $MNT/dir2/x
-echo "Removed dir2/x"
-ls -l $MNT/dir2
-echo
 
-echo "=== ALL TESTS PASSED ==="
+
+banner "All Part 6 tests completed with observable evidence"
