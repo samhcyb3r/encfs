@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# encfs_aesgcm.py
 import os
 import sys
 import time
