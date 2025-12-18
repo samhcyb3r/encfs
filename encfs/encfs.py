@@ -51,7 +51,7 @@ class Node:
 class EncryptedMemFS(LoggingMixIn, Operations):
     """
     In-memory FS + per-file encryption.
-    Passphrase is provided via setxattr -n user.key -v "pwd" <file>.
+    Passphrase is provided via setxattr -n user.passphrase -v "pwd" <file>.
     Key = PBKDF2(passphrase, salt, iterations) -> 32 bytes.
     Data encrypted by AESGCM(key, nonce).
     """
@@ -257,8 +257,8 @@ class EncryptedMemFS(LoggingMixIn, Operations):
 
     # -------- xattr for passphrase --------
     def setxattr(self, path, name, value, options, position=0):
-        # setfattr -n user.key -v "mypwd" <file>
-        if name != "user.key":
+        # setfattr -n user.passphrase -v "mypwd" <file>
+        if name != "user.passphrase":
             return 0
         n = self._ensure_file(path)
 
@@ -278,7 +278,7 @@ class EncryptedMemFS(LoggingMixIn, Operations):
         return []
 
     def removexattr(self, path, name):
-        if name == "user.key":
+        if name == "user.passphrase":
             n = self._ensure_file(path)
             n.key_cached = None
         return 0
