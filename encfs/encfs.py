@@ -16,271 +16,303 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 
-def _now():
+def _current_timestamp():
+    """獲取當前時間戳記"""
     return time.time()
 
 
-def _parent(p: str) -> str:
-    if p == "/":
+def _get_parent_path(filepath: str) -> str:
+    """取得父目錄路徑"""
+    if filepath == "/":
         return "/"
-    d = os.path.dirname(p.rstrip("/"))
-    return d if d else "/"
+    parent_dir = os.path.dirname(filepath.rstrip("/"))
+    return parent_dir if parent_dir else "/"
 
 
-def _basename(p: str) -> str:
-    return os.path.basename(p.rstrip("/")) or "/"
+def _extract_filename(filepath: str) -> str:
+    """提取檔案名稱"""
+    return os.path.basename(filepath.rstrip("/")) or "/"
 
 
 @dataclass
-class Node:
+class FileNode:
+    """檔案系統節點（File/Directory）"""
     st_mode: int
     st_nlink: int
     st_size: int = 0
-    st_ctime: float = field(default_factory=_now)
-    st_mtime: float = field(default_factory=_now)
-    st_atime: float = field(default_factory=_now)
-    children: Set[str] = field(default_factory=set)  # for directories
+    st_ctime: float = field(default_factory=_current_timestamp)
+    st_mtime: float = field(default_factory=_current_timestamp)
+    st_atime: float = field(default_factory=_current_timestamp)
+    child_entries: Set[str] = field(default_factory=set)  # 子項目集合
 
-    # encryption-related (for files)
-    salt: Optional[bytes] = None              # per-file salt for KDF
-    nonce: Optional[bytes] = None             # AESGCM nonce
-    ciphertext: bytes = b""                   # encrypted content (includes tag in AESGCM)
-    key_cached: Optional[bytes] = None        # derived 32-byte key (session cache)
+    # 加密相關屬性（檔案專用）
+    kdf_salt: Optional[bytes] = None              # KDF 派生用 salt
+    gcm_nonce: Optional[bytes] = None             # GCM 模式的 nonce
+    encrypted_data: bytes = b""                   # 加密後內容
+    derived_aes_key: Optional[bytes] = None       # 派生的 AES 金鑰（快取）
 
 
 class EncryptedMemFS(LoggingMixIn, Operations):
     """
-    In-memory FS + per-file encryption.
-    Passphrase is provided via setxattr -n user.passphrase -v "pwd" <file>.
-    Key = PBKDF2(passphrase, salt, iterations) -> 32 bytes.
-    Data encrypted by AESGCM(key, nonce).
+    記憶體加密檔案系統（In-Memory Encrypted FS）
+    - 密碼透過 setxattr -n user.passphrase -v "pwd" <file> 提供
+    - 金鑰透過 PBKDF2(passphrase, salt, iterations) 派生 -> 32 bytes
+    - 資料使用 AESGCM(key, nonce) 加密
     """
     def __init__(self):
-        self.nodes: Dict[str, Node] = {}
-        self.fd = 0
+        self.filesystem_nodes: Dict[str, FileNode] = {}
+        self.next_file_descriptor = 0
 
-        # root
-        root = Node(st_mode=(S_IFDIR | 0o755), st_nlink=2)
-        self.nodes["/"] = root
+        # 建立根目錄
+        root_node = FileNode(st_mode=(S_IFDIR | 0o755), st_nlink=2)
+        self.filesystem_nodes["/"] = root_node
 
-    # -------- helpers --------
-    def _ensure_exists(self, path: str) -> Node:
-        n = self.nodes.get(path)
-        if n is None:
+    # -------- 輔助方法 --------
+    def _verify_path_exists(self, filepath: str) -> FileNode:
+        """驗證路徑存在"""
+        node = self.filesystem_nodes.get(filepath)
+        if node is None:
             raise FuseOSError(errno.ENOENT)
-        return n
+        return node
 
-    def _ensure_file(self, path: str) -> Node:
-        n = self._ensure_exists(path)
-        if (n.st_mode & S_IFDIR) == S_IFDIR:
+    def _verify_is_file(self, filepath: str) -> FileNode:
+        """驗證是一般檔案"""
+        node = self._verify_path_exists(filepath)
+        if (node.st_mode & S_IFDIR) == S_IFDIR:
             raise FuseOSError(errno.EISDIR)
-        return n
+        return node
 
-    def _ensure_dir(self, path: str) -> Node:
-        n = self._ensure_exists(path)
-        if (n.st_mode & S_IFDIR) != S_IFDIR:
+    def _verify_is_directory(self, filepath: str) -> FileNode:
+        """驗證是目錄"""
+        node = self._verify_path_exists(filepath)
+        if (node.st_mode & S_IFDIR) != S_IFDIR:
             raise FuseOSError(errno.ENOTDIR)
-        return n
+        return node
 
-    def _touch_times(self, n: Node, *, atime=False, mtime=False):
-        t = _now()
-        if atime:
-            n.st_atime = t
-        if mtime:
-            n.st_mtime = t
+    def _update_timestamps(self, node: FileNode, *, access_time=False, modify_time=False):
+        """更新時間戳記"""
+        timestamp = _current_timestamp()
+        if access_time:
+            node.st_atime = timestamp
+        if modify_time:
+            node.st_mtime = timestamp
 
-    def _derive_key(self, passphrase: bytes, salt: bytes, iterations: int = 200_000) -> bytes:
+    def _perform_key_derivation(self, user_passphrase: bytes, salt_value: bytes, 
+                                kdf_iterations: int = 200_000) -> bytes:
+        """執行 PBKDF2 金鑰派生"""
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=iterations,
+            length=32,  # AES-256 需要 32 bytes
+            salt=salt_value,
+            iterations=kdf_iterations,
             backend=default_backend(),
         )
-        return kdf.derive(passphrase)
+        return kdf.derive(user_passphrase)
 
-    def _require_key(self, n: Node):
-        if n.key_cached is None:
+    def _enforce_key_presence(self, node: FileNode):
+        """強制檢查金鑰存在"""
+        if node.derived_aes_key is None:
             raise FuseOSError(errno.EACCES)
 
-    def _encrypt_into_node(self, n: Node, plaintext: bytes):
-        self._require_key(n)
-        if n.nonce is None:
-            # 12 bytes nonce is recommended for GCM
-            n.nonce = os.urandom(12)
-        aesgcm = AESGCM(n.key_cached)
-        n.ciphertext = aesgcm.encrypt(n.nonce, plaintext, None)
-        n.st_size = len(plaintext)
-        self._touch_times(n, mtime=True)
+    def _perform_encryption(self, node: FileNode, plaintext_data: bytes):
+        """執行加密並更新節點"""
+        self._enforce_key_presence(node)
+        if node.gcm_nonce is None:
+            # GCM 建議使用 12 bytes nonce
+            node.gcm_nonce = os.urandom(12)
+        
+        aes_cipher = AESGCM(node.derived_aes_key)
+        node.encrypted_data = aes_cipher.encrypt(node.gcm_nonce, plaintext_data, None)
+        node.st_size = len(plaintext_data)
+        self._update_timestamps(node, modify_time=True)
 
-    def _decrypt_from_node(self, n: Node) -> bytes:
-        self._require_key(n)
-        if not n.ciphertext:
+    def _perform_decryption(self, node: FileNode) -> bytes:
+        """執行解密並回傳明文"""
+        self._enforce_key_presence(node)
+        if not node.encrypted_data:
             return b""
-        if n.nonce is None:
+        if node.gcm_nonce is None:
             raise FuseOSError(errno.EACCES)
+        
         try:
-            aesgcm = AESGCM(n.key_cached)
-            pt = aesgcm.decrypt(n.nonce, n.ciphertext, None)
-            self._touch_times(n, atime=True)
-            return pt
+            aes_cipher = AESGCM(node.derived_aes_key)
+            plaintext = aes_cipher.decrypt(node.gcm_nonce, node.encrypted_data, None)
+            self._update_timestamps(node, access_time=True)
+            return plaintext
         except Exception:
-            # wrong key / corrupted data
+            # 金鑰錯誤或資料損毀
             raise FuseOSError(errno.EACCES)
 
-    # -------- FUSE ops --------
+    # -------- FUSE 操作實作 --------
     def getattr(self, path, fh=None):
-        n = self._ensure_exists(path)
-        st = {
-            "st_mode": n.st_mode,
-            "st_nlink": n.st_nlink,
-            "st_size": n.st_size,
-            "st_ctime": n.st_ctime,
-            "st_mtime": n.st_mtime,
-            "st_atime": n.st_atime,
-            # make it usable by current user (avoid "root-owned" surprises)
+        """取得檔案屬性"""
+        node = self._verify_path_exists(path)
+        attributes = {
+            "st_mode": node.st_mode,
+            "st_nlink": node.st_nlink,
+            "st_size": node.st_size,
+            "st_ctime": node.st_ctime,
+            "st_mtime": node.st_mtime,
+            "st_atime": node.st_atime,
             "st_uid": os.getuid(),
             "st_gid": os.getgid(),
         }
-        return st
+        return attributes
 
     def readdir(self, path, fh):
-        d = self._ensure_dir(path)
-        entries = [".", ".."]
-        # use stored children for real hierarchy (not scanning all paths)
-        entries.extend(sorted(d.children))
-        return entries
+        """讀取目錄內容"""
+        directory = self._verify_is_directory(path)
+        dir_entries = [".", ".."]
+        dir_entries.extend(sorted(directory.child_entries))
+        return dir_entries
 
     def mkdir(self, path, mode):
-        parent = _parent(path)
-        name = _basename(path)
-        pd = self._ensure_dir(parent)
-        if path in self.nodes:
+        """建立目錄"""
+        parent_path = _get_parent_path(path)
+        dir_name = _extract_filename(path)
+        parent_dir = self._verify_is_directory(parent_path)
+        
+        if path in self.filesystem_nodes:
             raise FuseOSError(errno.EEXIST)
 
-        self.nodes[path] = Node(st_mode=(S_IFDIR | mode), st_nlink=2)
-        pd.children.add(name)
-        pd.st_nlink += 1
-        self._touch_times(pd, mtime=True)
+        self.filesystem_nodes[path] = FileNode(st_mode=(S_IFDIR | mode), st_nlink=2)
+        parent_dir.child_entries.add(dir_name)
+        parent_dir.st_nlink += 1
+        self._update_timestamps(parent_dir, modify_time=True)
 
     def rmdir(self, path):
+        """刪除目錄"""
         if path == "/":
             raise FuseOSError(errno.EPERM)
-        d = self._ensure_dir(path)
-        if d.children:
+        
+        directory = self._verify_is_directory(path)
+        if directory.child_entries:
             raise FuseOSError(errno.ENOTEMPTY)
 
-        parent = _parent(path)
-        name = _basename(path)
-        pd = self._ensure_dir(parent)
+        parent_path = _get_parent_path(path)
+        dir_name = _extract_filename(path)
+        parent_dir = self._verify_is_directory(parent_path)
 
-        pd.children.discard(name)
-        pd.st_nlink = max(2, pd.st_nlink - 1)
-        self._touch_times(pd, mtime=True)
+        parent_dir.child_entries.discard(dir_name)
+        parent_dir.st_nlink = max(2, parent_dir.st_nlink - 1)
+        self._update_timestamps(parent_dir, modify_time=True)
 
-        self.nodes.pop(path, None)
+        self.filesystem_nodes.pop(path, None)
 
     def create(self, path, mode, fi=None):
-        parent = _parent(path)
-        name = _basename(path)
-        pd = self._ensure_dir(parent)
-        if path in self.nodes:
+        """建立檔案"""
+        parent_path = _get_parent_path(path)
+        file_name = _extract_filename(path)
+        parent_dir = self._verify_is_directory(parent_path)
+        
+        if path in self.filesystem_nodes:
             raise FuseOSError(errno.EEXIST)
 
-        n = Node(st_mode=(S_IFREG | mode), st_nlink=1)
-        # per-file salt (=> per-file key even if same passphrase)
-        n.salt = os.urandom(16)
-        self.nodes[path] = n
-        pd.children.add(name)
-        self._touch_times(pd, mtime=True)
+        new_node = FileNode(st_mode=(S_IFREG | mode), st_nlink=1)
+        # 為每個檔案產生專屬 salt（確保 per-file 金鑰）
+        new_node.kdf_salt = os.urandom(16)
+        self.filesystem_nodes[path] = new_node
+        parent_dir.child_entries.add(file_name)
+        self._update_timestamps(parent_dir, modify_time=True)
 
-        self.fd += 1
-        return self.fd
+        self.next_file_descriptor += 1
+        return self.next_file_descriptor
 
     def open(self, path, flags):
-        self._ensure_exists(path)
-        self.fd += 1
-        return self.fd
+        """開啟檔案"""
+        self._verify_path_exists(path)
+        self.next_file_descriptor += 1
+        return self.next_file_descriptor
 
     def unlink(self, path):
+        """刪除檔案"""
         if path == "/":
             raise FuseOSError(errno.EPERM)
-        n = self._ensure_file(path)
+        
+        node = self._verify_is_file(path)
 
-        parent = _parent(path)
-        name = _basename(path)
-        pd = self._ensure_dir(parent)
+        parent_path = _get_parent_path(path)
+        file_name = _extract_filename(path)
+        parent_dir = self._verify_is_directory(parent_path)
 
-        pd.children.discard(name)
-        self._touch_times(pd, mtime=True)
+        parent_dir.child_entries.discard(file_name)
+        self._update_timestamps(parent_dir, modify_time=True)
 
-        # remove node
-        self.nodes.pop(path, None)
-        # wipe sensitive material in memory best-effort
-        n.key_cached = None
-        n.ciphertext = b""
+        # 移除節點並清除敏感資料
+        self.filesystem_nodes.pop(path, None)
+        node.derived_aes_key = None
+        node.encrypted_data = b""
 
     def truncate(self, path, length, fh=None):
-        n = self._ensure_file(path)
-        self._require_key(n)
+        """截斷檔案"""
+        node = self._verify_is_file(path)
+        self._enforce_key_presence(node)
 
-        pt = self._decrypt_from_node(n)
+        plaintext = self._perform_decryption(node)
         if length == 0:
-            pt2 = b""
+            new_plaintext = b""
         else:
-            pt2 = pt[:length].ljust(length, b"\x00")
-        self._encrypt_into_node(n, pt2)
+            new_plaintext = plaintext[:length].ljust(length, b"\x00")
+        
+        self._perform_encryption(node, new_plaintext)
         return 0
 
     def utimens(self, path, times=None):
-        n = self._ensure_exists(path)
-        now = _now()
-        atime, mtime = times if times else (now, now)
-        n.st_atime = atime
-        n.st_mtime = mtime
+        """更新檔案時間"""
+        node = self._verify_path_exists(path)
+        current_time = _current_timestamp()
+        access_time, modify_time = times if times else (current_time, current_time)
+        node.st_atime = access_time
+        node.st_mtime = modify_time
 
     def read(self, path, size, offset, fh):
-        n = self._ensure_file(path)
-        pt = self._decrypt_from_node(n)
-        return pt[offset: offset + size]
+        """讀取檔案內容"""
+        node = self._verify_is_file(path)
+        plaintext = self._perform_decryption(node)
+        return plaintext[offset: offset + size]
 
     def write(self, path, data, offset, fh):
-        n = self._ensure_file(path)
-        self._require_key(n)
+        """寫入檔案內容"""
+        node = self._verify_is_file(path)
+        self._enforce_key_presence(node)
 
-        pt = self._decrypt_from_node(n)
-        if offset > len(pt):
-            pt = pt + b"\x00" * (offset - len(pt))
-        new_pt = pt[:offset] + data + pt[offset + len(data):]
-        self._encrypt_into_node(n, new_pt)
+        plaintext = self._perform_decryption(node)
+        if offset > len(plaintext):
+            plaintext = plaintext + b"\x00" * (offset - len(plaintext))
+        
+        updated_plaintext = plaintext[:offset] + data + plaintext[offset + len(data):]
+        self._perform_encryption(node, updated_plaintext)
         return len(data)
 
-    # -------- xattr for passphrase --------
+    # -------- 擴充屬性（用於密碼傳遞）--------
     def setxattr(self, path, name, value, options, position=0):
+        """設定擴充屬性（處理密碼輸入）"""
         # setfattr -n user.passphrase -v "mypwd" <file>
         if name != "user.passphrase":
             return 0
-        n = self._ensure_file(path)
+        
+        node = self._verify_is_file(path)
 
-        if n.salt is None:
-            n.salt = os.urandom(16)
+        if node.kdf_salt is None:
+            node.kdf_salt = os.urandom(16)
 
-        # value from fusepy is bytes
-        passphrase = bytes(value)
-        n.key_cached = self._derive_key(passphrase, n.salt)
+        user_passphrase = bytes(value)
+        node.derived_aes_key = self._perform_key_derivation(user_passphrase, node.kdf_salt)
         return 0
 
     def getxattr(self, path, name, position=0):
-        # keep it minimal (avoid leaking anything)
+        """取得擴充屬性（避免洩漏資訊）"""
         return b""
 
     def listxattr(self, path):
+        """列出擴充屬性"""
         return []
 
     def removexattr(self, path, name):
+        """移除擴充屬性"""
         if name == "user.passphrase":
-            n = self._ensure_file(path)
-            n.key_cached = None
+            node = self._verify_is_file(path)
+            node.derived_aes_key = None
         return 0
 
 
@@ -288,6 +320,7 @@ def main():
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} <mountpoint>")
         sys.exit(1)
+    
     mountpoint = sys.argv[1]
     FUSE(EncryptedMemFS(), mountpoint, foreground=True, nothreads=True)
 
