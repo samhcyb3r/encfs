@@ -65,5 +65,10 @@ All file contents are stored **only in memory and always encrypted**, providing 
 
 ### Set encryption key
 ```bash
-setfattr -n user.key -v "mypassword" file.txt
+setfattr -n user.passphrase -v "mypassword" file.txt
+```
+
+### Remove encryption key
+```bash
+setfattr -n user.passphrase -v "mypassword" file.txt
 ```
