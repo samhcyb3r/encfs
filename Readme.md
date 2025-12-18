@@ -70,5 +70,5 @@ setfattr -n user.passphrase -v "mypassword" file.txt
 
 ### Remove encryption key
 ```bash
-setfattr -n user.passphrase -v "mypassword" file.txt
+setfattr -x user.passphrase -v "mypassword" file.txt
 ```
